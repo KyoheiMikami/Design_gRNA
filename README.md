@@ -39,7 +39,7 @@ gRNA配列を次の2領域に分け、
 high stringencyの場合：
 
 - Proximal seqに0 mismatch
-- Proximal seqに1 mismatch かつ Distal seqに1 mismatch
+- Proximal seqに1 mismatch かつ Distal seqに2 mismatch未満
 
 のいずれかに該当する
 ```
@@ -48,8 +48,8 @@ high stringencyの場合：
 maximum stringencyの場合：
 
 - Proximal seqに0 mismatch
-- Proximal seqに1 mismatch かつ Distal seqに5 mismatch
-- Proximal seqに2 mismatch かつ Distal seqに2 mismatch
+- Proximal seqに1 mismatch かつ Distal seqに5 mismatch未満
+- Proximal seqに2 mismatch かつ Distal seqに2 mismatch未満
 
 のいずれかに該当する
 ```
