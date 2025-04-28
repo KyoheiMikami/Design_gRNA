@@ -88,4 +88,4 @@ python3 gRNA_finder.py -i input_file.txt -g reference_file.fa
 - python3
 - Cas-OFFinder (3.0.0を想定)
 
-が使えること。Cas-OFFinderは、OpenCLに対応するランタイムAPIが必要。
+が使えること。
