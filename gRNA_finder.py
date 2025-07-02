@@ -5,161 +5,170 @@ import tempfile
 import os
 from collections import defaultdict
 
+# --- Constants ---
 DNA_COMPLEMENT = str.maketrans("ATCG", "TAGC")
+MIN_GRNA_LENGTH = 12
+DEFAULT_GRNA_LENGTH = 20
+DEFAULT_MISMATCHES = 3
+DEFAULT_BULGE = 0
+DEFAULT_OUTPUT_FILE = "output_GF.txt"
+CASOFFINDER_DEFAULT_PATH = "cas-offinder"
 
-def reverse_complement(seq):
+# --- Utility Functions ---
+def reverse_complement(seq: str) -> str:
+    """Calculates the reverse complement of a DNA sequence."""
     return seq.translate(DNA_COMPLEMENT)[::-1]
 
-def find_gRNA_candidates(input_file, gRNA_length):
-    if gRNA_length < 12:
-        raise ValueError(f"invalid gRNA length: set > 12 nt value")
-        
+def count_mismatches(seq: str) -> int:
+    """Counts lowercase characters (mismatches) in a DNA sequence."""
+    return sum(1 for nt in seq if nt.islower())
+
+def split_regions(seq: str) -> tuple[str, str, str]:
+    """Splits a sequence into distal, proximal, and PAM regions."""
+    return seq[:-15], seq[-15:-3], seq[-3:]
+
+# --- Core Functions ---
+def find_gRNA_candidates(input_file: str, gRNA_length: int) -> list[str]:
+    """Finds unique forward and reverse gRNA candidates ending with NGG."""
+    if gRNA_length < MIN_GRNA_LENGTH:
+        raise ValueError(f"Invalid gRNA length: must be ≥ {MIN_GRNA_LENGTH} nt")
+
     with open(input_file, "r") as f:
         dna_seq = f.read().upper()
 
-    pattern = f"(?=([ATGC]{{{gRNA_length}}}[ATGC]GG))"
+    pattern = re.compile(f"(?=([ATGC]{{{gRNA_length}}}[ATGC]GG))")
 
-    forward_matches = re.findall(pattern, dna_seq)
-    reverse_matches = re.findall(pattern, reverse_complement(dna_seq))
+    forward = pattern.findall(dna_seq)
+    reverse = pattern.findall(reverse_complement(dna_seq))
 
-    set_f = set(forward_matches)
-    set_r = set([reverse_complement(match) for match in reverse_matches])
+    set_forward = set(forward)
+    unique_reverse = [m for m in reverse if reverse_complement(m) not in set_forward]
 
-    unique_reverse_matches = [match for match in reverse_matches if reverse_complement(match) not in set_f]
+    print(f"✓ Found {len(forward)} forward gRNA candidates.")
+    print(f"✓ Found {len(reverse)} reverse gRNA candidates ({len(unique_reverse)} unique after filtering).")
 
-    return forward_matches + unique_reverse_matches
+    return forward + unique_reverse
 
-def make_CO_input(gRNA_candidates, genome_path, gRNA_length, mismatches, bulge, input_file):    
-    with open(input_file, "w") as out:
-        out.write(genome_path + "\n")
-        out.write(f"{'N'*gRNA_length}NGG {bulge} {bulge}\n")
-        for i, g in enumerate(gRNA_candidates, 1):
+def make_CO_input(gRNAs: list[str], genome_path: str, gRNA_length: int, mismatches: int, bulge: int, out_file: str):
+    """Writes Cas-OFFinder input file."""
+    with open(out_file, "w") as out:
+        out.write(f"{genome_path}\n")
+        out.write(f"{'N' * gRNA_length}NGG {bulge} {bulge}\n")
+        for i, g in enumerate(gRNAs, 1):
             out.write(f"{g} {mismatches} g{i}\n")
 
-def run_CO(input_CO, output_CO, CO_path="cas-offinder"):
-    command = [CO_path, input_CO, "C", output_CO]
-    subprocess.run(command, check=True)
-    print(f"✓ Cas-OFFinder finished.")
+def run_CO(input_file: str, output_file: str, path: str = CASOFFINDER_DEFAULT_PATH):
+    """Runs Cas-OFFinder with error capture."""
+    cmd = [path, input_file, "C", output_file]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("✓ Cas-OFFinder completed successfully.")
+    except subprocess.CalledProcessError as e:
+        print("❌ Error running Cas-OFFinder:")
+        print("STDOUT:\n", e.stdout)
+        print("STDERR:\n", e.stderr)
+        raise
 
-def split_regions(dna_seq):
-    pam = dna_seq[-3:]
-    proximal = dna_seq[-15:-3]
-    distal = dna_seq[:-15]
-    return distal, proximal, pam
-
-def count_mismatches(dna_seq):
-    return sum(1 for nt in dna_seq if nt.islower())
-
-def check_condition(dna_seq, stringency="high", is_exact_match=False):
-    if is_exact_match:
-        return True
+def passes_stringency(dna_seq: str, level: str) -> bool:
+    """Returns True if off-target fails the stringency check (should be excluded)."""
     distal, proximal, _ = split_regions(dna_seq)
-    distal_mm = count_mismatches(distal)
-    proximal_mm = count_mismatches(proximal)
+    dmm = count_mismatches(distal)
+    pmm = count_mismatches(proximal)
 
-    if stringency == "high":
-        return not ((proximal_mm == 0) or (proximal_mm == 1 and distal_mm < 2))
-    elif stringency == "maximum":
-        return not ((proximal_mm == 0) or 
-                    (proximal_mm == 1 and distal_mm < 5) or
-                    (proximal_mm == 2 and distal_mm < 2)
-                   )
+    if level == "high":
+        return (pmm == 0) or (pmm == 1 and dmm < 2)
+    elif level == "maximum":
+        return (pmm == 0) or (pmm == 1 and dmm < 5) or (pmm == 2 and dmm < 2)
     else:
-        raise ValueError(f"Invalid stringency level: {stringency}")
+        raise ValueError(f"Invalid stringency level: {level}")
 
-def filter_offtargets(output_CO, output_file, stringency="high"):
-    with open(output_CO, encoding="utf-8") as f:
-        lines = f.readlines()
+def filter_offtargets(cas_output: str, output_file: str, stringency: str):
+    """Filters Cas-OFFinder output and writes accepted gRNAs."""
+    with open(cas_output, encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
 
-    header = [line for line in lines if line.startswith("#")]
-    data = [line for line in lines if not line.startswith("#") and line.strip()]
+    headers = [l for l in lines if l.startswith("#")]
+    entries = [l for l in lines if not l.startswith("#")]
 
-    # gRNA IDごとにグループ化
     grouped = defaultdict(list)
-    for line in data:
-        cols = line.strip().split("\t")
-        id_ = cols[0]
-        dna_seq = cols[3]
-        grouped[id_].append((line.strip(), dna_seq))
+    for line in entries:
+        cols = line.split("\t")
+        gRNA_id, aligned_seq = cols[0], cols[3]
+        grouped[gRNA_id].append((line, aligned_seq))
 
-    accepted_lines = []
-    accepted_ids = []
+    accepted_lines, accepted_ids = [], []
 
-    for id_, entries in grouped.items():
-        exclude_this_gRNA = False
+    for gRNA_id, records in grouped.items():
+        has_on_target = False
+        exclude = False
 
-        for line, dna in entries:
-            mm_count = count_mismatches(dna)
-            if mm_count == 0:
-                continue  # ミスマッチ0（オンターゲット候補）は常に許容
-            distal, proximal, _ = split_regions(dna)
-            distal_mm = count_mismatches(distal)
-            proximal_mm = count_mismatches(proximal)
+        for _, seq in records:
+            mm = count_mismatches(seq)
+            if mm == 0:
+                has_on_target = True
+                continue
+            if passes_stringency(seq, stringency):
+                exclude = True
+                break
 
-            if stringency == "high":
-                if (proximal_mm == 0) or (proximal_mm == 1 and distal_mm < 2):
-                    exclude_this_gRNA = True
-                    break
-            elif stringency == "maximum":
-                if (proximal_mm == 0) or \
-                   (proximal_mm == 1 and distal_mm < 5) or \
-                   (proximal_mm == 2 and distal_mm < 2):
-                    exclude_this_gRNA = True
-                    break
-            else:
-                raise ValueError(f"Invalid stringency level: {stringency}")
-
-        if not exclude_this_gRNA:
-            for line, dna in entries:
-                mm = count_mismatches(dna)
-                flag = " # 0MM" if mm == 0 else ""
-                accepted_lines.append(line + flag)
-            accepted_ids.append(id_)
+        if has_on_target and not exclude:
+            accepted_ids.append(gRNA_id)
+            for line, seq in records:
+                mm = count_mismatches(seq)
+                accepted_lines.append(line + (" # 0MM" if mm == 0 else ""))
 
     with open(output_file, "w", encoding="utf-8") as f:
-        for line in header + accepted_lines:
-            f.write(line + "\n")
+        for h in headers:
+            f.write(h + "\n")
+        for l in accepted_lines:
+            f.write(l + "\n")
 
-    print(f"\n✓ Filtering complete. Valid gRNAs: {len(accepted_ids)}. Output: {output_file}\n")
+    print(f"✓ Filtering complete. Valid gRNAs: {len(accepted_ids)}. Output: {output_file}")
 
-
+# --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Full gRNA candidate pipeline with Cas-OFFinder")
-    parser.add_argument("-i", "--input_file", required=True, help="Input DNA sequence (as .txt)")
-    parser.add_argument("-l", "--gRNA_length", type=int, default=20, help="Number of bases before PAM (default: 20)")
-    parser.add_argument("-g", "--genome_path", required=True, help="Path to genome file (e.g. 2bit)")
-    parser.add_argument("-m", "--mismatches", type=int, default=3, help="Max number of mismatches")
-    parser.add_argument("-b", "--bulge", type=int, default=0, help="Max number of bulges")
-    parser.add_argument("--CO_path", default="cas-offinder", help="Cas-OFFinder executable path")
-    parser.add_argument("-s", "--stringency", choices=["high", "maximum"], default="high", help="Stringency level for off-target filtering (default: high)")
-    parser.add_argument("-t", "--save_temp", action="store_true", help="Save intermediate input/output files")
-    parser.add_argument("-o", "--output_file", default="output_GF.txt", help="Filtered output file")
+    parser = argparse.ArgumentParser(description="gRNA candidate filter pipeline using Cas-OFFinder")
+    parser.add_argument("-i", "--input_file", required=True, help="DNA sequence input (TXT)")
+    parser.add_argument("-l", "--gRNA_length", type=int, default=DEFAULT_GRNA_LENGTH, help="gRNA length before PAM (default: 20)")
+    parser.add_argument("-g", "--genome_path", required=True, help="Path to genome file (2bit or FASTA)")
+    parser.add_argument("-m", "--mismatches", type=int, default=DEFAULT_MISMATCHES, help="Max allowed mismatches")
+    parser.add_argument("-b", "--bulge", type=int, default=DEFAULT_BULGE, help="Max bulges allowed")
+    parser.add_argument("--CO_path", default=CASOFFINDER_DEFAULT_PATH, help="Cas-OFFinder executable path")
+    parser.add_argument("-s", "--stringency", choices=["high", "maximum"], default="high", help="Filtering stringency level")
+    parser.add_argument("-t", "--save_temp", action="store_true", help="Save intermediate files")
+    parser.add_argument("-o", "--output_file", default=DEFAULT_OUTPUT_FILE, help="Output file name")
     args = parser.parse_args()
 
-    gRNA_candidates = find_gRNA_candidates(args.input_file, args.gRNA_length)
-    print(f"\n✓ Found {len(gRNA_candidates)} gRNA candidates (forward + reverse).\n")
+    print("✓ Starting gRNA pipeline...\n")
 
-    # 一時ファイルまたは保存
+    # Step 1: gRNA search
+    gRNAs = find_gRNA_candidates(args.input_file, args.gRNA_length)
+    if not gRNAs:
+        print("❌ No gRNA candidates found. Exiting.")
+        return
+
+    # Step 2: Prepare temp or named files
     if args.save_temp:
         input_CO = "Cas-OFFinder_input.txt"
         output_CO = "Cas-OFFinder_output.txt"
+        print(f"✓ Intermediate files will be saved: {input_CO}, {output_CO}")
     else:
-        input_CO_fd, input_CO = tempfile.mkstemp()
-        os.close(input_CO_fd)
-        output_CO_fd, output_CO = tempfile.mkstemp()
-        os.close(output_CO_fd)
+        input_CO = tempfile.NamedTemporaryFile(delete=False).name
+        output_CO = tempfile.NamedTemporaryFile(delete=False).name
 
-    make_CO_input(gRNA_candidates, args.genome_path, args.gRNA_length, args.mismatches, args.bulge, input_CO)
-    run_CO(input_CO, output_CO, args.CO_path)
-    filter_offtargets(output_CO, args.output_file, stringency=args.stringency)
+    try:
+        make_CO_input(gRNAs, args.genome_path, args.gRNA_length, args.mismatches, args.bulge, input_CO)
+        run_CO(input_CO, output_CO, args.CO_path)
+        filter_offtargets(output_CO, args.output_file, args.stringency)
+    finally:
+        if not args.save_temp:
+            for f in [input_CO, output_CO]:
+                if os.path.exists(f):
+                    os.remove(f)
+        else:
+            print(f"✓ Intermediate files saved: {input_CO}, {output_CO}")
 
-    if not args.save_temp:
-        os.remove(input_CO)
-        os.remove(output_CO)
-    else:
-        print(f"✓ Intermediate files saved as: {input_CO}, {output_CO}\nß")
-    
-    print(f"✓ Final filtered output: {args.output_file}\n")
-        
+    print(f"✓ Pipeline completed. Output: {args.output_file}")
+
 if __name__ == "__main__":
     main()
